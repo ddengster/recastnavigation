@@ -38,6 +38,9 @@
 #include "ConvexVolumeTool.h"
 #include "CrowdTool.h"
 
+#include <vector>
+#include <unordered_map>
+
 #ifdef WIN32
 #	define snprintf _snprintf
 #endif
@@ -642,7 +645,8 @@ bool Sample_SoloMesh::handleBuild()
 
 	// At this point the navigation mesh data is ready, you can access it from m_pmesh.
 	// See duDebugDrawPolyMesh or dtCreateNavMeshData as examples how to access the data.
-	
+	doMengeExport();
+
 	//
 	// (Optional) Step 8. Create Detour data from Recast poly mesh.
 	//
@@ -750,6 +754,191 @@ bool Sample_SoloMesh::handleBuild()
 	if (m_tool)
 		m_tool->init(this);
 	initToolStates(this);
+
+	return true;
+}
+
+bool Sample_SoloMesh::doMengeExport()
+{
+	struct MengeEdge
+	{
+		int v0_idx;
+		int v1_idx;
+		int p0_idx;
+		int p1_idx;
+	};
+	std::vector<MengeEdge> edges;
+	std::unordered_map<uint, uint> edges_search;
+	auto ToHash = [](unsigned short a, unsigned short b) -> uint
+	{
+		uint ret = (uint)a;
+		return ret << 16 | b;
+	};
+	auto search_edges_via_poly_idx = [ToHash, &edges_search](unsigned short a, unsigned short b)
+	{
+		uint hash = a < b ? ToHash(a, b) : ToHash(b, a);
+		return edges_search.find(hash);
+	};
+	auto insert_edge_search = [ToHash, &edges_search](unsigned short a, unsigned short b, unsigned short idx)
+	{
+		uint hash = a < b ? ToHash(a, b) : ToHash(b, a);
+		edges_search.emplace(hash, idx);
+	};
+	
+	struct MengePoly
+	{
+		float center[2];
+		std::vector<unsigned short> vtx_indices;
+		//std::vector<float[3]> plane_gradients;
+		std::vector<unsigned short> edge_indices;
+		//std::vector<unsigned short> obstacle_indices;
+	};
+	std::vector<MengePoly> polygons;
+
+	//float scale = 0.0821218733149518f;
+	
+	// assemble edges + polys
+	int max_vertices_per_poly = m_pmesh->nvp;
+	for (int i=0; i<m_pmesh->npolys; ++i)
+	{
+		uint vertices_this_poly = 0;
+		uint connected_edges_this_poly = 0;
+
+		MengePoly poly;
+
+		const unsigned short* p_indices = &m_pmesh->polys[i * max_vertices_per_poly * 2];
+		
+		//compute center of polygon
+		float center[3] = { 0.f , 0.f, 0.f };
+		for (int j = 0; j < max_vertices_per_poly; ++j)
+		{
+			if (p_indices[j] == RC_MESH_NULL_IDX)
+				break; // end of list
+			++vertices_this_poly;
+
+			unsigned short v0_idx = p_indices[j];
+			unsigned short v1_idx = 0;
+			if (j == (max_vertices_per_poly - 1) || p_indices[j + 1] == RC_MESH_NULL_IDX)
+				v1_idx = p_indices[0];
+			else
+				v1_idx = p_indices[j + 1];
+
+			if (p_indices[j + max_vertices_per_poly] != RC_MESH_NULL_IDX)
+			{
+				++connected_edges_this_poly;
+				// The edge beginning with this vertex connects to 
+				// polygon p[j + nvp].
+				unsigned short connected_poly_idx = p_indices[j + max_vertices_per_poly];
+
+				//search for edges
+				auto it = search_edges_via_poly_idx(i, connected_poly_idx);
+				if (it != edges_search.end())
+				{
+					poly.edge_indices.push_back(it->second);
+				}
+				else
+				{
+					MengeEdge e;
+					e.v0_idx = v0_idx;
+					e.v1_idx = v1_idx;
+					e.p0_idx = i;
+					e.p1_idx = connected_poly_idx;
+
+					edges.push_back(e);
+					poly.edge_indices.push_back(edges.size() - 1);
+
+					insert_edge_search(i, connected_poly_idx, edges.size() - 1);
+				}
+			}
+
+			 // Convert to world space.
+			const unsigned short* v = &m_pmesh->verts[p_indices[j]*3];
+			center[0] += m_pmesh->bmin[0] + v[0] * m_pmesh->cs;
+			center[1] += m_pmesh->bmin[1] + v[1] * m_pmesh->ch;
+			center[2] += m_pmesh->bmin[2] + v[2] * m_pmesh->cs;
+		}
+
+		center[0] /= (float)vertices_this_poly;
+		center[1] /= (float)vertices_this_poly;
+		center[2] /= (float)vertices_this_poly;
+
+		printf("center: %f %f %f\n", center[0], center[1], center[2]);
+		
+		poly.center[0] = center[0];
+		poly.center[1] = -center[2];
+
+		//poly vertices
+		for (int j = 0; j < max_vertices_per_poly; ++j)
+		{
+			if (p_indices[j] == RC_MESH_NULL_IDX)
+				break; // end of list
+			poly.vtx_indices.push_back(p_indices[j]);
+		}
+		polygons.push_back(poly);
+	}
+	printf("polycount: %d\n", polygons.size());
+
+	FILE* f = fopen("./test.nav", "wb+");
+	if (!f)
+		return false;
+	// write vertices
+	fprintf(f, "%d\r\n", m_pmesh->nverts);
+	for (int i=0; i<m_pmesh->nverts; ++i)
+	{
+		//@reference: https://github.com/recastnavigation/recastnavigation/blob/9337e124182697de93acb656ef25766486738807/Docs/Extern/Recast_api.txt#L410
+		float worldX = m_pmesh->bmin[0] + m_pmesh->verts[i*3+0] * m_pmesh->cs;
+		//float worldY = m_pmesh->bmin[1] + m_pmesh->verts[i*3+1] * m_pmesh->ch;
+		float worldZ = m_pmesh->bmin[2] + m_pmesh->verts[i*3+2] * m_pmesh->cs;
+
+		fprintf(f, "%f %f\r\n", worldX, -worldZ);
+	}
+	fprintf(f, "\r\n");
+
+	// portals
+	fprintf(f, "%d\r\n", edges.size());
+	for (auto e : edges)
+	{
+		fprintf(f, "%d %d %d %d\r\n", e.v0_idx, e.v1_idx, e.p0_idx, e.p1_idx);
+	}
+	fprintf(f, "\r\n");
+
+	// obstacles
+	fprintf(f, "0\r\n");
+	fprintf(f, "\r\n");
+
+	// nodes/polygons
+	//@reference: https://github.com/recastnavigation/recastnavigation/blob/9337e124182697de93acb656ef25766486738807/Docs/Extern/Recast_api.txt#L369
+	fprintf(f, "walkable\r\n");
+	fprintf(f, "%d\r\n", polygons.size());
+
+	for (auto poly : polygons)
+	{
+		fprintf(f, "\r\n");
+
+		fprintf(f, "%f %f\r\n", poly.center[0], poly.center[1]);
+
+		// vertices
+		fprintf(f, "%d ", poly.vtx_indices.size());
+		for (auto vtx_idx : poly.vtx_indices)
+		{
+			fprintf(f, "%d ", vtx_idx);
+		}
+		fprintf(f, "\r\n");
+
+		fprintf(f, "0 0 0\r\n");
+
+		// edges
+		fprintf(f, "%d ", poly.edge_indices.size());
+		for (auto edge_idx : poly.edge_indices)
+		{
+			fprintf(f, "%d ", edge_idx);
+		}
+		fprintf(f, "\r\n");
+
+		// 0 obstacles
+		fprintf(f, "0\r\n");
+	}
+	fclose(f);
 
 	return true;
 }
